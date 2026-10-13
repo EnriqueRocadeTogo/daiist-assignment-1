@@ -1,9 +1,9 @@
 # Assignment 1 Report — Fair value of central-Madrid flats
 
 - **Name**: Enrique Roca de Togores Pérez-Castro
-- **Student ID**: TODO
-- **Email**: TODO (IE email)
-- **Group**: TODO [BBADBA 5A | BBADBA 5B | PPLEDBA 5A | BDBA 3A]
+- **Student ID**: 20044
+- **Email**: erocadetogor.ieu2022@student.ie.edu
+- **Group**: BBADBA 5B
 
 **Run:** `uv run python main.py train` (≈2 min) then `uv run python main.py app`.
 Training lives in `train.ipynb`, the dashboard in `app.py`, and the code both share (cleaning, features, metrics, the `nn.Module`) in `pipeline.py`.
