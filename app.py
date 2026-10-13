@@ -194,8 +194,11 @@ def convergence_plot() -> go.Figure:
 def config_markdown() -> str:
     c = CFG
     return (
-        f"**Universe** {c['universe']} · **target** {c['target']} · **split** model selection {c['split']['selection']}, "
-        f"final {c['split']['final']} · **{c['n_train']:,}** train / **{c['n_test']:,}** test flats · "
+        # "<=" would be read as the start of an HTML tag and break the bold text after it, so use plain symbols
+        f"**Universe** {c['universe'].replace('<=', '≤').replace('m2', 'm²')} · "
+        f"**target** {c['target'].replace('EUR/m2', '€/m²')} · "
+        f"**split** model selection {c['split']['selection'].replace('->', '→')}, "
+        f"final {c['split']['final'].replace('->', '→')} · **{c['n_train']:,}** train / **{c['n_test']:,}** test flats · "
         f"**{c['n_features']}** features  \n"
         f"**Model** {c['model']} · **manual loop** full-batch gradient descent, lr = {c['lr_manual']}, "
         f"{c['epochs_manual']:,} epochs · **nn.Module** mini-batch SGD, lr = {c['lr_module']}, batch {c['batch_size']}, "
