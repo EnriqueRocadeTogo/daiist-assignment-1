@@ -58,7 +58,7 @@ regression adjusts it for the flat's features.
 |---|---|---|
 | Coordinates outside Madrid | 94,721 | fall in no neighbourhood polygon (some are 400 km away) |
 | Universe: central almond | 45,245 | the investor's market |
-| One flat = one row | 36,203 | the same `ASSETID` appears up to 3 times in the **same quarter** at different prices: the same flat listed by several agencies. I keep the cheapest (the price a buyer could get). Otherwise a copy of a test flat could sit in training. |
+| One flat = one row | 36,203 | the same `ASSETID` appears up to 3 times in the **same quarter** at different prices: the same flat listed by several agencies. I keep the cheapest (the price a buyer could get). Otherwise the flat would count up to three times, and any random split could put copies on both sides. |
 | Zero bathrooms | 36,163 | data-entry errors |
 | Over 400 m² | **35,750** | whole buildings and mansions, outside the mandate |
 
