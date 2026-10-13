@@ -160,6 +160,41 @@ normal rate (the model prices them in). Ground-floor flats (16% of flags vs 11% 
 which points to factors the model cannot see. That is why the output is a visit list, not a buy list. The dashboard lets
 the user move *d*, the cap and the cost per visit.
 
+## Results and key findings
+
+**Feature engineering drives the improvement.** Using the original columns alone barely beats the baseline of the
+median price per m² in each neighbourhood: on the validation set the error only drops from 15.0% to 14.4%. With the
+engineered features it falls to 11.4%. The test set confirms it: the error goes from 14.7% to 11.4%, and the share of
+properties valued within ±10% of their asking price rises from 35% to 45%.
+
+**Location is the most important factor.** Removing it raises the validation error by 4.5 percentage points. Next come
+property size and extras (+2.2 points), floor level and lift, including their interaction (+1.2 points), and building
+characteristics (+0.3 points).
+
+**The market trend barely changes the typical error, but it prevents a systematic bias.** Without it, the model
+undervalues the validation quarter by 3.4%, roughly the market's price rise. Including the trend lets the model account
+for prices moving over time.
+
+**Regularisation brings no noticeable improvement.** Ridge regression performs no better than plain linear regression.
+With around 170 properties per feature there is no sign of overfitting, so regularisation is not necessary.
+
+**All three training methods produce almost identical results.** The manual PyTorch loop reaches the same solution as
+scikit-learn, apart from tiny rounding differences. Mini-batch SGD is also very close: the estimated price of a typical
+property differs by 0.6%, because of the noise introduced by mini-batches. In practice, the business metrics are the
+same for all three methods.
+
+**All three models overestimate Q4 prices by around 1%.** They learned an average price increase of 2.1% per quarter,
+while the market only rose 1.1% from Q3 to Q4. This gap explains most of the overestimation in that quarter.
+
+**The bargain detector is a tool to decide which properties to visit, not which to buy.** With a 20% threshold it flags
+1,459 properties, about €583,600 in viewing costs at an assumed €400 per visit. It also sets aside 167 implausible
+listings whose discounts are too large to be genuine bargains: most likely bare ownership, auctions, occupied flats or
+typos, which would only waste visits.
+
+Ground-floor apartments and properties in the Centro district appear more often than average among the flagged
+listings. This suggests that the model is missing factors specific to these property types or locations. The flagged
+opportunities should therefore be reviewed individually before any purchase decision.
+
 ## Limitations & next steps
 
 1. **Asking prices, not sale prices.** The target is what sellers ask. In Madrid, sale prices are typically below asking
@@ -177,10 +212,14 @@ the user move *d*, the cap and the cost per visit.
 
 ## Generative AI use disclosure
 
-I used Claude (Anthropic) as an assistant throughout the project:
-- **Code:** it wrote most of the code (data preparation script, `pipeline.py`, `train.ipynb`, `app.py`) from the decisions below, and
-  the plotting and Gradio layout.
-- **Decisions:** I chose the dataset (idealista Madrid), the target (log €/m²), the universe (central almond) and the time-based split.
-  For the business framing and the feature blocks, Claude proposed options with their reasoning and I chose among them. Validation
-  results then decided which features stayed and the switch from target encoding to one-hot neighbourhoods.
-- **Report:** Claude drafted this report from the results; I reviewed and edited it, and I can explain every decision and number in it.
+This project was joint work with Claude (Anthropic), used as an assistant throughout:
+- **Code:** Claude wrote most of the code (data preparation script, `pipeline.py`, `train.ipynb`, `app.py`), including the plots
+  and the Gradio layout, following the decisions below.
+- **Decisions:** I chose the dataset (idealista Madrid), the target (log €/m²), the universe (central almond) and the time-based
+  split. For the business framing and the feature blocks, Claude proposed options with their reasoning; I asked it to pick the
+  strongest ones and reviewed them. Validation results (the ablation and the regularisation check) then decided which features
+  stayed, and the switch from target encoding to one-hot neighbourhoods.
+- **Report:** Claude drafted the Dataset, Framing, Data preparation, Modeling and Limitations sections from the results.
+  The "Results and key findings" section is my own writing; Claude only corrected the grammar, clarified a few sentences and
+  checked every figure against the results.
+- I have reviewed the whole project and can explain every decision and number in it.
