@@ -31,22 +31,27 @@ Three facts from the publisher's anonymisation code shape the whole analysis:
 
 ## Business / real-life framing
 
-**Scenario.** A buy-to-let investor screens the new for-sale listings in Madrid's *almendra central* (the seven
-central districts) every quarter. There are hundreds; the team can only visit a few. The model estimates each flat's
-**fair asking price per m²** from its characteristics and location, and the investor visits the listings that ask
-clearly less than that fair value. This is a comparables valuation: €/m² plays the role of the multiple, and the
-regression adjusts it for the flat's features.
+Consider a buy-to-let investor who receives hundreds of new property listings every quarter in central Madrid but can
+only visit a small number of them. The model estimates the fair asking price per square metre of each flat, so the
+investor can prioritise listings advertised well below their estimated value. This is similar to comparing companies
+with valuation multiples such as EV/EBITDA: price per square metre is the benchmark multiple, adjusted for each
+property's characteristics.
 
-**What the framing decides in the pipeline:**
+The target variable is log(price per square metre). Dividing by m² makes properties of different sizes comparable, the
+log reduces skewness, and the coefficients can be read approximately as percentage premiums. A time-based split is
+essential because the model must value properties listed after its training period, and asking prices in the data rose
+by about 2.5% per quarter during 2018. Model selection therefore trains on Q1–Q2 and validates on Q3, while the final
+model is trained on Q1–Q3 and evaluated once on Q4. A random split would leak future prices into training. For the same
+reason the time trend is a number from 0 to 3: a Q4 dummy could never be learned, because Q4 never appears in training.
 
-| Framing fact | Decision |
-|---|---|
-| The model values listings that appear *after* training | **Time-based split.** Model selection: train Q1–Q2, validate Q3. Final model: train Q1–Q3, test once on Q4. A random split would put December prices in training and flatter the test. |
-| Prices rise through 2018 (median €4,423 → €4,636/m² from Q1 to Q3) | A **numeric** quarter trend (`t_quarter` = 0…3). A Q4 dummy could never be learned from Q1–Q3. |
-| Flats of different sizes are compared per m², and errors hurt in % | **Target = log(€/m²).** Coefficients read as % premiums; errors are relative. |
-| Accuracy that matters to an investor | **MdAPE** (median absolute % error) and **PPE10** (% of flats valued within ±10%), the standard accuracy measures of automated valuation models. RMSE and R² on the log scale are also reported. |
-| The fund buys ordinary flats in the central districts | Universe = districts 01–07, ≤ 400 m². |
-| The decision is "visit or not" | A listing is flagged if `1 − asking / fair value ≥ d`. *d* is the 90th percentile of discounts on the **validation** quarter (20%), about 1.7× the model's typical error, so a flag is not just model noise. Discounts above the 99th percentile (45%) are set aside as implausible (see below). |
+Performance is measured with MdAPE (median absolute percentage error) and PPE10 (share of properties valued within
+±10%), because an error of 10% matters as much on a €200,000 flat as on a €1 million one. The analysis covers districts
+01–07, properties up to 400 m² and one observation per property.
+
+A listing qualifies as a potential bargain when its asking price is at least 20% below its estimated fair value. This
+threshold is the 90th percentile of the discounts on the validation quarter and about 1.7 times the model's typical
+error (MdAPE). A 45% cap, the 99th percentile, filters out implausible cases. Assuming a cost of €400 per visit, this
+focuses due diligence on the most promising opportunities.
 
 ![Target and drift](artifacts/figures/target_and_drift.png)
 
@@ -197,18 +202,30 @@ opportunities should therefore be reviewed individually before any purchase deci
 
 ## Limitations & next steps
 
-1. **Asking prices, not sale prices.** The target is what sellers ask. In Madrid, sale prices are typically below asking
-   prices, and the gap varies by area. *Next:* recalibrate with notarial or Registradores transaction data.
-2. **Non-standard listings sit in the training data.** Bare ownership, auctions and occupied flats look like normal ads but are
-   priced far lower. The screen sets them aside, but they still pull the regression (RMSE is hurt more than MdAPE). *Next:* use the
-   ad's description to flag them, or a loss less sensitive to outliers (Huber).
-3. **The trend extrapolates linearly.** It overshot Q4 by ~1 point. *Next:* re-estimate every quarter, or replace it with an official
-   price index (INE / Registradores) as an input.
-4. **Unobserved quality.** Light, views, street noise and the real state of the flat are not in the data, and they explain part of
-   the 11% error and many of the flags. *Next:* features from the listing photos and text.
-5. **Truncated luxury segment and anonymisation noise.** Ads above €10,444/m² were removed and prices carry ±2.5% noise, so the model
-   should not be used for prime Salamanca/Recoletos product. *Next:* source the unfiltered data.
-6. **One year, one city.** All of this is 2018; the coefficients will drift. *Next:* retrain quarterly and monitor MdAPE and bias on each new quarter.
+**Asking prices versus transaction prices.** The model uses asking prices rather than completed transaction prices,
+which are typically lower, and the gap varies across neighbourhoods. The model should be recalibrated with actual
+transaction data from notaries or the Spanish Land Registrars Association (Registradores).
+
+**Unusual listings in the training data.** Bare-ownership, auction and occupied properties may distort the regression,
+even though the screening process excludes them from the final shortlist. These listings should be identified from the
+listing descriptions, or handled with a loss function that is less sensitive to outliers, such as the Huber loss.
+
+**Linear time trend.** The model overestimated the Q4 price increase: it learned a quarterly increase of 2.1%, while the
+observed increase was 1.1%. The trend should be re-estimated every quarter or replaced with an official housing price
+index, such as the one published by Spain's National Statistics Institute (INE).
+
+**Unobserved property quality.** Natural light, views, noise and the actual condition of the property are not captured,
+which may explain part of the 11% prediction error and some of the false bargains. Information extracted from listing
+photographs and descriptions could improve valuation accuracy.
+
+**Limited coverage of the luxury segment and price noise.** Listings above €10,444/m² were excluded by the publisher,
+which also added random noise of up to ±2.5% to every price to anonymise the data. The model should therefore not be
+used to value prime properties in areas such as Salamanca or Recoletos without additional data and segment-specific
+calibration.
+
+**Limited historical coverage.** The model is based on a single year of data, so coefficients estimated in 2018 may no
+longer reflect current market conditions. The model should be retrained every quarter, with prediction errors and
+systematic bias monitored over time.
 
 ## Generative AI use disclosure
 
@@ -220,7 +237,8 @@ This project was joint work with Claude (Anthropic), used as an assistant throug
   location-and-trend block myself and adopted Claude's recommendation for the framing and the remaining blocks after reviewing
   the reasoning; the validation results (ablation and regularisation check) then confirmed each of them, and decided the switch
   from target encoding to one-hot neighbourhoods.
-- **Report:** Claude drafted the Dataset, Framing, Data preparation, Modeling and Limitations sections from the results.
-  The "Results and key findings" section is my own writing; Claude only corrected the grammar, clarified a few sentences and
-  checked every figure against the results.
+- **Report:** Claude drafted the Dataset, Data preparation & feature engineering and Modeling sections from the results.
+  The Business / real-life framing, Results and key findings, and Limitations & next steps sections are my own writing,
+  based on an outline of the key points and figures that Claude prepared; Claude then corrected the grammar, clarified a
+  few sentences and checked every figure against the results.
 - I have reviewed the whole project and can explain every decision and number in it.
