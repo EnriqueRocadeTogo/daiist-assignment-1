@@ -1,11 +1,21 @@
 """
-Shared code for the two stages: train.ipynb (training) and app.py (serving).
+Shared code for the two stages: train.ipynb (training) and app.py (dashboard).
 
-Why a separate module: the Gradio app must apply *exactly* the same cleaning
-and feature transformations as training, with the statistics learned on the
-training set (imputation values, scaler, neighbourhood list). Keeping that
-logic in one place avoids train/serve skew. Everything that *learns* from
-data lives in FeatureBuilder.fit_transform(); everything else is deterministic.
+Why a separate module? The dashboard must turn a listing into model inputs in
+*exactly* the same way as training did, using the numbers learned from the
+training data (medians for missing values, the list of neighbourhoods, the
+mean and standard deviation of each feature). If that code were copied into
+two places, the two copies could drift apart and the app would feed the
+models slightly different inputs ("train/serve skew"). One module, used by
+both stages, rules that out.
+
+Contents
+    1. loading the committed data
+    2. clean()          -> which listings we keep, and why
+    3. row_features()   -> the engineered features
+    4. FeatureBuilder   -> learns medians / neighbourhoods / scaling on TRAIN only
+    5. LinearRegressionModel -> the nn.Module used by the standard PyTorch workflow
+    6. metrics
 """
 
 from __future__ import annotations
@@ -23,11 +33,11 @@ ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 ARTIFACTS_DIR = ROOT / "artifacts"
 
-# idealista publishes one snapshot per quarter of 2018
+# idealista publishes one snapshot per quarter of 2018 (PERIOD = yyyymm)
 QUARTER_LABEL = {201803: "Q1", 201806: "Q2", 201809: "Q3", 201812: "Q4"}
 QUARTER_INDEX = {201803: 0, 201806: 1, 201809: 2, 201812: 3}
 
-# "Almendra central" (central almond): Madrid's 7 central districts.
+# "Almendra central": Madrid's 7 central districts, the investor's market.
 # The district code is the second-to-last block of idealista's LOCATIONID.
 ALMENDRA_CENTRAL = {
     "01": "Centro",
@@ -39,36 +49,38 @@ ALMENDRA_CENTRAL = {
     "07": "Chamberí",
 }
 
-MAX_AREA_M2 = 400
-TYPICAL_AREA_M2 = 90  # centre of the squared size term (the median flat is ~90 m2)
+MAX_AREA_M2 = 400     # bigger = whole buildings / mansions, outside the mandate
+TYPICAL_AREA_M2 = 90  # the median flat; the squared size term is measured from here
 
 
-# --------------------------------------------------------------------------
-# Loading
-# --------------------------------------------------------------------------
+# ==========================================================================
+# 1. Loading
+# ==========================================================================
 def load_listings() -> pd.DataFrame:
+    """All 94,815 Madrid for-sale ads of 2018 (built by data/prepare_dataset.py)."""
     return pd.read_csv(DATA_DIR / "madrid_sale_2018.csv.gz", dtype={"ASSETID": str})
 
 
 def load_neighbourhoods() -> dict:
+    """The 135 idealista neighbourhood polygons (GeoJSON)."""
     return json.loads((DATA_DIR / "madrid_barrios.geojson").read_text())
 
 
 def assign_neighbourhood(df: pd.DataFrame, polygons: dict) -> pd.DataFrame:
-    """Point-in-polygon: which idealista neighbourhood each listing falls in.
+    """The data has coordinates but no neighbourhood name, so we look up which
+    neighbourhood polygon each flat's point falls inside ("point in polygon").
 
-    The dataset ships coordinates but no neighbourhood. Anonymisation moved
-    every listing 30-60 m *within its own neighbourhood*, so the polygon
-    lookup still returns the true one.
+    This is safe despite the anonymisation: the publisher moved every flat
+    30-60 m but always kept it inside its own neighbourhood.
     """
-    pts = df[["LONGITUDE", "LATITUDE"]].to_numpy()
+    points = df[["LONGITUDE", "LATITUDE"]].to_numpy()
     name = np.full(len(df), None, dtype=object)
     loc_id = np.full(len(df), None, dtype=object)
     for feat in polygons["features"]:
         inside = np.zeros(len(df), dtype=bool)
         for polygon in feat["geometry"]["coordinates"]:
-            for ring in polygon:  # even-odd rule: a hole ring toggles back to outside
-                inside ^= MplPath(np.asarray(ring)).contains_points(pts)
+            for ring in polygon:  # a polygon can have holes: each ring flips inside/outside
+                inside ^= MplPath(np.asarray(ring)).contains_points(points)
         new = inside & pd.isna(name)
         name[new] = feat["properties"]["LOCATIONNAME"]
         loc_id[new] = feat["properties"]["LOCATIONID"]
@@ -79,12 +91,13 @@ def assign_neighbourhood(df: pd.DataFrame, polygons: dict) -> pd.DataFrame:
     return out
 
 
-# --------------------------------------------------------------------------
-# Cleaning: deterministic row filters, no statistics learned from the data,
-# so it is safe to run before the train/test split.
-# --------------------------------------------------------------------------
+# ==========================================================================
+# 2. Cleaning
+# Only row filters that do not learn anything from the data, so they can be
+# applied before the train/test split without leaking information.
+# ==========================================================================
 def clean(df: pd.DataFrame, polygons: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Returns the modelling dataset and a log of how many rows each rule removed."""
+    """Returns (modelling dataset, log of how many rows each rule removed)."""
     log = []
 
     def step(name, new_df, reason):
@@ -106,14 +119,15 @@ def clean(df: pd.DataFrame, polygons: dict) -> tuple[pd.DataFrame, pd.DataFrame]
                "Whole buildings and mansions: a different product, outside a buy-to-let mandate")
     cur = cur.sort_values(["PERIOD", "ASSETID"]).reset_index(drop=True)
     cur["QUARTER"] = cur["PERIOD"].map(QUARTER_LABEL)
-    cur["LOG_UNITPRICE"] = np.log(cur["PRICE"] / cur["CONSTRUCTEDAREA"])  # the target
+    # THE TARGET: log of the asking price per square metre
+    cur["LOG_UNITPRICE"] = np.log(cur["PRICE"] / cur["CONSTRUCTEDAREA"])
     return cur, pd.DataFrame(log)
 
 
-# --------------------------------------------------------------------------
-# Feature engineering
-# --------------------------------------------------------------------------
-# Control model: the published columns as they come, minimally imputed.
+# ==========================================================================
+# 3. Feature engineering
+# ==========================================================================
+# Control model for the comparison: the published columns as they come.
 RAW_COLUMNS = [
     "CONSTRUCTEDAREA", "ROOMNUMBER", "BATHNUMBER", "FLOORCLEAN", "HASLIFT",
     "HASTERRACE", "HASAIRCONDITIONING", "HASPARKINGSPACE", "HASNORTHORIENTATION",
@@ -127,9 +141,10 @@ RAW_COLUMNS = [
 
 ENGINEERED_BLOCKS = ["trend", "location", "building", "floor", "size_extras"]
 
-# Building eras: price vs. age is U-shaped (historic buildings and new builds
-# carry a premium; the 1960-79 stock is the cheapest), which a single linear
-# "year" term cannot capture. 1960-79 is the reference category.
+# Construction eras. Price vs. age is not a straight line: old pre-war
+# buildings and recent ones are worth more than the 1960-79 blocks. One dummy
+# per era lets the model give each era its own premium. 1960-79 is the
+# reference era (no dummy), so each coefficient reads "vs. a 1960-79 building".
 ERAS = [
     ("era_pre1900", -np.inf, 1900),
     ("era_1900_1939", 1900, 1940),
@@ -140,7 +155,8 @@ ERAS = [
 
 
 def row_features(df: pd.DataFrame, imputes: dict) -> pd.DataFrame:
-    """Deterministic, row-wise features. `imputes` holds training-set medians."""
+    """Engineered features computed row by row.
+    `imputes` holds medians learned on the training set (to fill missing values)."""
     f = pd.DataFrame(index=df.index)
     area = df["CONSTRUCTEDAREA"].astype(float)
     rooms = df["ROOMNUMBER"].astype(float)
@@ -149,31 +165,34 @@ def row_features(df: pd.DataFrame, imputes: dict) -> pd.DataFrame:
     year = df["CADCONSTRUCTIONYEAR"].astype(float)
     quality = df["CADASTRALQUALITYID"].astype(float).replace(0, np.nan)  # 0 = not recorded
 
-    # trend: a *numeric* quarter index. A Q4 dummy would never be seen while
-    # training on Q1-Q3, so only a numeric trend can extrapolate the price drift.
+    # --- trend -----------------------------------------------------------
+    # Prices rise during 2018. A number 0,1,2,3 lets a straight line carry the
+    # trend into Q4. A "Q4" dummy would be useless: Q4 is never in training.
     f["t_quarter"] = df["PERIOD"].map(QUARTER_INDEX).astype(float)
 
-    # location (the neighbourhood itself is added in FeatureBuilder): distances
-    # in logs, because the first 500 m to the metro matter far more than going
-    # from 2 to 2.5 km. The +50 m floor avoids log(0).
+    # --- location (the neighbourhood dummies are added in FeatureBuilder) --
+    # Logs: the first few hundred metres matter much more than the next ones.
+    # +0.05 km (50 m) avoids log(0) for a flat right on top of the metro.
     f["log_dist_castellana"] = np.log(df["DISTANCE_TO_CASTELLANA"] + 0.05)
     f["log_dist_sol"] = np.log(df["DISTANCE_TO_CITY_CENTER"] + 0.05)
     f["log_dist_metro"] = np.log(df["DISTANCE_TO_METRO"] + 0.05)
 
-    # building
+    # --- building ----------------------------------------------------------
     for name, lo, hi in ERAS:
         f[name] = ((year >= lo) & (year < hi)).astype(float)
-    f["cadastral_quality"] = quality.fillna(imputes["cadastral_quality"])  # 1 best ... 9 worst
+    f["cadastral_quality"] = quality.fillna(imputes["cadastral_quality"])  # 1 = best ... 9 = worst
     f["new_build"] = df["BUILTTYPEID_1"].astype(float)
     f["needs_renovation"] = df["BUILTTYPEID_2"].astype(float)
     f["log_building_floors"] = np.log(df["CADMAXBUILDINGFLOOR"].clip(lower=1).astype(float))
     f["log_building_units"] = np.log1p(df["CADDWELLINGCOUNT"].astype(float))
     f["doorman"] = df["HASDOORMAN"].astype(float)
 
-    # floor x lift: every floor you climb on foot is a penalty; with a lift it is not
+    # --- floor x lift ------------------------------------------------------
+    # A high floor is worth more only if there is a lift. floors_without_lift
+    # counts the floors you climb on foot: an INTERACTION (floor x no lift).
     floor_filled = floor.fillna(imputes["floor"])
     f["floor"] = floor_filled.clip(lower=0)
-    f["floor_unknown"] = floor.isna().astype(float)
+    f["floor_unknown"] = floor.isna().astype(float)  # missing indicator: the advertiser hid it
     f["semi_basement"] = (floor_filled < 0).astype(float)
     f["ground_floor"] = (floor_filled == 0).astype(float)
     f["lift"] = lift
@@ -183,12 +202,12 @@ def row_features(df: pd.DataFrame, imputes: dict) -> pd.DataFrame:
     f["exterior_unknown"] = df["FLATLOCATIONID"].isna().astype(float)
     f["south_facing"] = df["HASSOUTHORIENTATION"].astype(float)
 
-    # size & extras: EUR/m2 falls with size, so log(area) enters even though
-    # the target is already per m2.
+    # --- size & extras -------------------------------------------------------
+    # EUR/m2 falls as flats get bigger, then rises again for very large ones:
+    # a U-shape. A straight line cannot bend, so we add the square of log(m2).
+    # It is measured from a typical 90 m2 flat so that log_m2 and its square
+    # are not near-copies of each other (that would slow gradient descent).
     f["log_m2"] = np.log(area)
-    # U-shape: tiny studios and very large flats both carry a higher EUR/m2.
-    # Centred at 90 m2 before squaring so it is not ~collinear with log_m2
-    # (an uncentred square made X'X ~7x worse conditioned for gradient descent).
     f["log_m2_sq"] = (f["log_m2"] - np.log(TYPICAL_AREA_M2)) ** 2
     f["m2_per_room"] = area / rooms.clip(lower=1)
     f["baths_per_room"] = df["BATHNUMBER"].astype(float) / rooms.clip(lower=1)
@@ -200,7 +219,7 @@ def row_features(df: pd.DataFrame, imputes: dict) -> pd.DataFrame:
     f["wardrobes"] = df["HASWARDROBE"].astype(float)
     f["pool"] = df["HASSWIMMINGPOOL"].astype(float)
     f["garden"] = df["HASGARDEN"].astype(float)
-    # a parking space included in the asking price inflates EUR/m2 without more flat
+    # a parking space included in the asking price raises EUR/m2 without more flat
     f["parking_included"] = df["ISPARKINGSPACEINCLUDEDINPRICE"].astype(float)
     f["no_kitchen_furniture"] = (df["AMENITYID"] == 1).astype(float)
     f["furnished"] = (df["AMENITYID"] == 3).astype(float)
@@ -209,7 +228,7 @@ def row_features(df: pd.DataFrame, imputes: dict) -> pd.DataFrame:
 
 BLOCK_COLUMNS = {
     "trend": ["t_quarter"],
-    "location": ["log_dist_castellana", "log_dist_sol", "log_dist_metro"],  # + neighbourhood
+    "location": ["log_dist_castellana", "log_dist_sol", "log_dist_metro"],  # + one dummy per neighbourhood
     "building": [e[0] for e in ERAS] + [
         "cadastral_quality", "new_build", "needs_renovation", "log_building_floors",
         "log_building_units", "doorman",
@@ -227,44 +246,24 @@ BLOCK_COLUMNS = {
 
 
 class FeatureBuilder:
-    """Learns everything that needs training data, then transforms any split.
+    """Turns cleaned listings into the model's input matrix X.
 
-    blocks: engineered blocks to use, or ("raw",) for the no-feature-engineering
-            control (the published columns as they come).
-    neighbourhood_encoding: "onehot" (one dummy per neighbourhood) or "target"
-            (smoothed, out-of-fold target encoding: one number per neighbourhood).
+    fit_transform(train) LEARNS three things from the training rows only:
+        - medians used to fill missing values,
+        - the list of neighbourhoods (one dummy each, except a reference one),
+        - the mean and standard deviation of every feature (for standardising).
+    transform(other) then APPLIES those same numbers to validation, test or a
+    flat typed into the dashboard. Learning them on test data would leak
+    information from the future into the model.
+
+    blocks: which engineered blocks to use, or ("raw",) for the control model
+            that uses the published columns as they come.
     """
 
-    def __init__(self, blocks=tuple(ENGINEERED_BLOCKS), neighbourhood_encoding="onehot",
-                 smoothing=20.0, n_folds=5, seed=42):
+    def __init__(self, blocks=tuple(ENGINEERED_BLOCKS)):
         self.blocks = tuple(blocks)
-        self.neighbourhood_encoding = neighbourhood_encoding
-        self.smoothing = smoothing
-        self.n_folds = n_folds
-        self.seed = seed
 
-    # ---- target encoding (only used when neighbourhood_encoding="target") --
-    def _te_map(self, nbhd: pd.Series, y: pd.Series) -> tuple[dict, float]:
-        """Shrinks each neighbourhood's mean target towards the global mean;
-        `smoothing` acts like that many pseudo-observations at the global mean."""
-        prior = float(y.mean())
-        stats = y.groupby(nbhd).agg(["sum", "count"])
-        enc = (stats["sum"] + self.smoothing * prior) / (stats["count"] + self.smoothing)
-        return enc.to_dict(), prior
-
-    def _te_out_of_fold(self, nbhd: pd.Series, y: pd.Series) -> np.ndarray:
-        """Training rows get an encoding computed WITHOUT their own fold, so the
-        model cannot learn to trust a feature that already contains its own target."""
-        rng = np.random.default_rng(self.seed)
-        fold = rng.integers(0, self.n_folds, size=len(y))
-        out = np.empty(len(y))
-        for k in range(self.n_folds):
-            enc, prior = self._te_map(nbhd[fold != k], y[fold != k])
-            out[fold == k] = nbhd[fold == k].map(enc).fillna(prior).to_numpy()
-        return out
-
-    # ---- design matrix ---------------------------------------------------
-    def _frame(self, df: pd.DataFrame, nbhd_te: np.ndarray | None) -> pd.DataFrame:
+    def _frame(self, df: pd.DataFrame) -> pd.DataFrame:
         if self.blocks == ("raw",):
             raw = df[RAW_COLUMNS].astype(float)
             raw["FLOORCLEAN"] = raw["FLOORCLEAN"].fillna(self.imputes_["floor"])
@@ -275,32 +274,28 @@ class FeatureBuilder:
         cols = []
         for block in self.blocks:
             cols += BLOCK_COLUMNS[block]
-            if block != "location":
-                continue
-            if self.neighbourhood_encoding == "target":
-                rows["neighbourhood_te"] = nbhd_te
-                cols.append("neighbourhood_te")
-            else:  # one-hot; the first neighbourhood (alphabetically) is the reference
+            if block == "location":
+                # one 0/1 column per neighbourhood; the first one (alphabetical) is
+                # the reference and gets no column, otherwise the dummies would add
+                # up to the intercept (the "dummy variable trap")
                 for nb in self.neighbourhoods_[1:]:
                     rows[f"nbhd={nb}"] = (df["NEIGHBOURHOOD"] == nb).astype(float).to_numpy()
                     cols.append(f"nbhd={nb}")
         return rows[cols]
 
-    def fit_transform(self, df: pd.DataFrame, y) -> np.ndarray:
-        y = pd.Series(np.asarray(y, dtype=float))
-        nbhd = df["NEIGHBOURHOOD"].reset_index(drop=True)
+    def fit_transform(self, df: pd.DataFrame) -> np.ndarray:
         quality = df["CADASTRALQUALITYID"].replace(0, np.nan)
         self.imputes_ = {
             "floor": float(df["FLOORCLEAN"].median()),
             "cadastral_quality": float(quality.median()),
         }
         self.neighbourhoods_ = sorted(df["NEIGHBOURHOOD"].unique())
-        self.te_map_, self.te_prior_ = self._te_map(nbhd, y)
-        frame = self._frame(df, self._te_out_of_fold(nbhd, y))
+        frame = self._frame(df)
         self.feature_names_ = list(frame.columns)
         X = frame.to_numpy(dtype=float)
-        # standardise with TRAINING statistics only: gradient descent needs
-        # comparable feature scales, and the ridge penalty treats all weights alike
+        # Standardise: every feature gets mean 0 and std 1 on the training set.
+        # Gradient descent needs features on comparable scales (m2 in the
+        # hundreds vs. dummies in 0/1), otherwise one learning rate cannot suit all.
         self.mean_ = X.mean(axis=0)
         self.std_ = X.std(axis=0)
         self.std_[self.std_ == 0] = 1.0
@@ -310,16 +305,16 @@ class FeatureBuilder:
         return (self.unscaled_frame(df).to_numpy(dtype=float) - self.mean_) / self.std_
 
     def unscaled_frame(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Features before standardisation (human-readable units)."""
-        te = df["NEIGHBOURHOOD"].map(self.te_map_).fillna(self.te_prior_).to_numpy(dtype=float)
-        return self._frame(df, te)
+        """Features in their natural units (before standardising), for plots."""
+        return self._frame(df)
 
 
-# --------------------------------------------------------------------------
-# Model used by the standard PyTorch workflow (and reloaded by the app)
-# --------------------------------------------------------------------------
+# ==========================================================================
+# 5. The model for the standard PyTorch workflow (the app reloads it)
+# ==========================================================================
 class LinearRegressionModel(nn.Module):
-    """y_hat = X w + b. A single nn.Linear layer and no activation: linear regression."""
+    """prediction = X @ w + b. One nn.Linear layer and no activation function,
+    so it is exactly a linear regression."""
 
     def __init__(self, n_features: int):
         super().__init__()
@@ -329,10 +324,11 @@ class LinearRegressionModel(nn.Module):
         return self.linear(x).squeeze(-1)
 
 
-# --------------------------------------------------------------------------
-# Metrics. The target is log(EUR/m2); m2 cancels when going back to price,
-# so percentage errors on EUR/m2 are percentage errors on the price.
-# --------------------------------------------------------------------------
+# ==========================================================================
+# 6. Metrics
+# The target is log(EUR/m2). Going back to euros, the m2 cancel out, so a %
+# error on EUR/m2 is the same % error on the price.
+# ==========================================================================
 def regression_metrics(y_true_log, y_pred_log) -> dict:
     y_true_log = np.asarray(y_true_log, dtype=float)
     y_pred_log = np.asarray(y_pred_log, dtype=float)
@@ -344,13 +340,13 @@ def regression_metrics(y_true_log, y_pred_log) -> dict:
         "RMSE_log": float(np.sqrt(np.mean(resid ** 2))),
         "MAE_log": float(np.mean(np.abs(resid))),
         "R2_log": float(1 - ss_res / ss_tot),
-        "MdAPE_%": float(100 * np.median(ape)),
-        "PPE10_%": float(100 * np.mean(ape <= 0.10)),
+        "MdAPE_%": float(100 * np.median(ape)),        # median % error: "typical" miss
+        "PPE10_%": float(100 * np.mean(ape <= 0.10)),  # % of flats valued within +-10%
         "PPE20_%": float(100 * np.mean(ape <= 0.20)),
-        "median_bias_%": float(100 * (np.exp(np.median(-resid)) - 1)),  # >0: overvalues
+        "median_bias_%": float(100 * (np.exp(np.median(-resid)) - 1)),  # > 0: overvalues
     }
 
 
 def discount_vs_fair_value(y_true_log, y_pred_log) -> np.ndarray:
-    """1 - asking / fair value. 0.15 = 'asking 15% below what the model says it is worth'."""
+    """1 - asking / fair value. 0.20 = 'asks 20% less than the model says it is worth'."""
     return 1 - np.exp(np.asarray(y_true_log, dtype=float) - np.asarray(y_pred_log, dtype=float))
