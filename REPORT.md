@@ -216,9 +216,10 @@ This project was joint work with Claude (Anthropic), used as an assistant throug
 - **Code:** Claude wrote most of the code (data preparation script, `pipeline.py`, `train.ipynb`, `app.py`), including the plots
   and the Gradio layout, following the decisions below.
 - **Decisions:** I chose the dataset (idealista Madrid), the target (log €/m²), the universe (central almond) and the time-based
-  split. For the business framing and the feature blocks, Claude proposed options with their reasoning; I asked it to pick the
-  strongest ones and reviewed them. Validation results (the ablation and the regularisation check) then decided which features
-  stayed, and the switch from target encoding to one-hot neighbourhoods.
+  split. For the business framing and the feature blocks, Claude proposed options with their reasoning. I selected the
+  location-and-trend block myself and adopted Claude's recommendation for the framing and the remaining blocks after reviewing
+  the reasoning; the validation results (ablation and regularisation check) then confirmed each of them, and decided the switch
+  from target encoding to one-hot neighbourhoods.
 - **Report:** Claude drafted the Dataset, Framing, Data preparation, Modeling and Limitations sections from the results.
   The "Results and key findings" section is my own writing; Claude only corrected the grammar, clarified a few sentences and
   checked every figure against the results.
