@@ -241,4 +241,6 @@ This project was joint work with Claude (Anthropic), used as an assistant throug
   The Business / real-life framing, Results and key findings, and Limitations & next steps sections are my own writing,
   based on an outline of the key points and figures that Claude prepared; Claude then corrected the grammar, clarified a
   few sentences and checked every figure against the results.
+- **Reproduction:** I set up the environment with `uv sync` and ran `main.py train` and `main.py app` end to end on my
+  own laptop (macOS); the results matched the committed ones exactly.
 - I have reviewed the whole project and can explain every decision and number in it.
